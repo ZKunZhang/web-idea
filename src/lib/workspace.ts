@@ -2,7 +2,7 @@ export type WorkspaceFile = { path: string; content: string };
 export type Workspace = {
   name: string;
   files: WorkspaceFile[];
-  mode: 'demo' | 'directory' | 'upload';
+  mode: 'empty' | 'directory' | 'upload';
   skipped: number;
   directory?: DirectoryHandle;
 };

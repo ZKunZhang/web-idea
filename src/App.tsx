@@ -1,24 +1,25 @@
 import { lazy, Suspense, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, Code2, Copy, Eye, Files, FolderOpen, Info, ListTree, LoaderCircle, PanelLeftClose, PanelLeftOpen, RefreshCw, Search, ShieldCheck, Sparkles, TextSearch, X } from 'lucide-react';
+import { ArrowDown, ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, Code2, Copy, Eye, Files, FolderOpen, Info, ListTree, LoaderCircle, LocateFixed, PanelLeftClose, PanelLeftOpen, RefreshCw, Search, Share2, ShieldCheck, TextSearch, X } from 'lucide-react';
 import { FileTree } from './components/FileTree';
 import { FileIcon } from './components/FileIcon';
 import type { Target, ViewerHandle } from './components/CodeViewer';
-import { demoWorkspace } from './lib/demo';
 import { languageFor, readDirectory, readUpload, type DirectoryPickerWindow, type Workspace } from './lib/workspace';
 import { searchFiles, type SearchResult } from './lib/search';
+import { buildProjectIndex, findReferencesAt, resolveDefinitionAt, type NavigationTarget, type ReferenceTarget } from './lib/navigation';
 
 const CodeViewer = lazy(() => import('./components/CodeViewer'));
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
 const mod = isMac ? '⌘' : 'Ctrl';
-const initialPath = 'src/App.tsx';
 const languageLabels: Record<string, string> = { typescript: 'TypeScript', javascript: 'JavaScript', markdown: 'Markdown', json: 'JSON', css: 'CSS', html: 'HTML', plaintext: '纯文本', yaml: 'YAML', shell: 'Shell' };
+const emptyWorkspace: Workspace = { name: '本地工作空间', files: [], mode: 'empty', skipped: 0 };
+const referenceRoleLabels = { definition: '定义', import: '导入', usage: '使用' } as const;
 
 export default function App() {
-  const [workspace, setWorkspace] = useState<Workspace>(demoWorkspace);
+  const [workspace, setWorkspace] = useState<Workspace>(emptyWorkspace);
   const [workspaceId, setWorkspaceId] = useState(0);
-  const [activePath, setActivePath] = useState<string | null>(initialPath);
-  const [tabs, setTabs] = useState<string[]>([initialPath, 'src/components/Button.tsx']);
-  const [panel, setPanel] = useState<'files' | 'search'>('files');
+  const [activePath, setActivePath] = useState<string | null>(null);
+  const [tabs, setTabs] = useState<string[]>([]);
+  const [panel, setPanel] = useState<'files' | 'search' | 'references'>('files');
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [fileFilter, setFileFilter] = useState('');
   const [query, setQuery] = useState('');
@@ -35,18 +36,26 @@ export default function App() {
   const [quickOpen, setQuickOpen] = useState(false);
   const [quickQuery, setQuickQuery] = useState('');
   const [quickIndex, setQuickIndex] = useState(0);
+  const [referenceState, setReferenceState] = useState<{ definition: NavigationTarget; references: ReferenceTarget[]; truncated: boolean } | null>(null);
   const viewerRef = useRef<ViewerHandle | null>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const quickRef = useRef<HTMLInputElement>(null);
   const activeFile = workspace.files.find(file => file.path === activePath);
   const search = useMemo(() => searchFiles(workspace.files, deferredQuery, { caseSensitive, wholeWord }), [workspace.files, deferredQuery, caseSensitive, wholeWord]);
+  const projectIndex = useMemo(() => buildProjectIndex(workspace.files), [workspace.files]);
   const searchGroups = useMemo(() => {
     const groups = new Map<string, SearchResult[]>();
     search.results.forEach(result => groups.set(result.path, [...(groups.get(result.path) || []), result]));
     return [...groups.entries()];
   }, [search]);
   const quickFiles = useMemo(() => workspace.files.filter(file => file.path.toLowerCase().includes(quickQuery.toLowerCase())).slice(0, 40), [workspace.files, quickQuery]);
+  const fileLines = useMemo(() => new Map(workspace.files.map(file => [file.path, file.content.split('\n')])), [workspace.files]);
+  const referenceGroups = useMemo(() => {
+    const groups = new Map<string, ReferenceTarget[]>();
+    referenceState?.references.forEach(reference => groups.set(reference.path, [...(groups.get(reference.path) || []), reference]));
+    return [...groups.entries()];
+  }, [referenceState]);
 
   function message(text: string) { setNotice(text); }
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(''), 6500); return () => clearTimeout(timer); }, [notice]);
@@ -56,6 +65,22 @@ export default function App() {
     setTabs(old => old.includes(path) ? old : [...old, path]);
     setTarget({ path, line, column, length, request: Date.now() });
     if (window.innerWidth < 760) setSidebarVisible(false);
+  }
+  function openDefinition(target: NavigationTarget) {
+    openFile(target.path, target.line, target.column, target.length);
+  }
+  function goToDefinition() {
+    if (!activeFile) return;
+    const definition = resolveDefinitionAt(projectIndex, activeFile.path, cursor.line, cursor.column);
+    if (!definition) { message('当前位置没有可跳转的项目内定义，组件或变量可能来自外部依赖。'); return; }
+    openDefinition(definition);
+  }
+  function showReferences() {
+    if (!activeFile) return;
+    const result = findReferencesAt(projectIndex, activeFile.path, cursor.line, cursor.column);
+    if (!result) { message('当前位置没有可查询引用的项目内符号。'); return; }
+    setReferenceState(result);
+    setPanel('references'); setSidebarVisible(true);
   }
   function closeTab(path: string) {
     const index = tabs.indexOf(path);
@@ -72,7 +97,7 @@ export default function App() {
       next.files.find(file => /(^|\/)App\.[jt]sx$/.test(file.path))?.path || next.files.find(file => /\.[jt]sx$/.test(file.path))?.path || next.files[0].path;
     setWorkspace(next); setWorkspaceId(value => value + 1);
     setActivePath(preferred); setTabs(keepLocation ? [...new Set([...tabs.filter(path => next.files.some(file => file.path === path)), preferred])] : [preferred]);
-    setTarget(null); setCursor({ line: 1, column: 1 }); setFileFilter('');
+    setTarget(null); setCursor({ line: 1, column: 1 }); setFileFilter(''); setReferenceState(null);
     message(`已读取 ${next.files.length} 个文件${next.skipped ? `，已跳过 ${next.skipped} 个目录或文件（过滤、大小限制或读取失败）` : ''}`);
   }
   async function openLocal() {
@@ -111,15 +136,17 @@ export default function App() {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'p') { event.preventDefault(); showQuickOpen(); }
       if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'f') { event.preventDefault(); activateSearch(); }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'b') { event.preventDefault(); setSidebarVisible(value => !value); }
+      if (event.key === 'F12') { event.preventDefault(); if (event.shiftKey) showReferences(); else goToDefinition(); }
       if (event.key === 'Escape') { setQuickOpen(false); setHelpOpen(false); }
     };
     window.addEventListener('keydown', handler); return () => window.removeEventListener('keydown', handler);
   });
   const basename = (path: string) => path.split('/').pop();
+  const lineSnippet = (path: string, line: number) => (fileLines.get(path)?.[line - 1] || '').trim();
   const totalLines = activeFile ? activeFile.content.split('\n').length : 0;
 
   return <div className="ide-shell">
-    <div className="workspace-bar"><div className="workspace-breadcrumb"><FolderOpen size={16} /><span>{workspace.name}</span><ChevronRight size={12} /><span className="muted">工作空间</span><span className={`mode-pill ${workspace.mode === 'demo' ? 'demo-pill' : ''}`}>{workspace.mode === 'demo' ? '示例项目' : '本地项目'}</span></div><button className="command-search" aria-label="搜索文件，快速前往" onClick={showQuickOpen}><Search size={14} /><span>搜索文件，快速前往…</span><kbd>{mod} P</kbd></button><div className="workspace-actions"><span className="readonly-label"><Eye size={13} />只读浏览</span><button className="open-project" onClick={openLocal} disabled={busy}>{busy ? <LoaderCircle size={14} className="spin" /> : <FolderOpen size={14} />}{busy ? `读取中 · ${progress}` : '打开本地项目'}</button></div></div>
+    <div className="workspace-bar"><div className="workspace-breadcrumb"><FolderOpen size={16} /><span>{workspace.name}</span><ChevronRight size={12} /><span className="muted">工作空间</span><span className={`mode-pill ${workspace.mode === 'empty' ? 'empty-pill' : ''}`}>{workspace.mode === 'empty' ? '未打开项目' : '本地项目'}</span></div><button className="command-search" aria-label="搜索文件，快速前往" onClick={showQuickOpen}><Search size={14} /><span>搜索文件，快速前往…</span><kbd>{mod} P</kbd></button><div className="workspace-actions"><span className="readonly-label"><Eye size={13} />只读浏览</span><button className="open-project" onClick={openLocal} disabled={busy}>{busy ? <LoaderCircle size={14} className="spin" /> : <FolderOpen size={14} />}{busy ? `读取中 · ${progress}` : '打开本地项目'}</button></div></div>
     <input ref={uploadRef} type="file" multiple {...{ webkitdirectory: '', directory: '' }} className="visually-hidden" aria-label="导入本地目录" onChange={async event => {
       const selected = event.target.files; if (!selected?.length) return;
       setBusy(true); setProgress(0);
@@ -133,20 +160,20 @@ export default function App() {
         <div><button className="activity-button" title="使用说明" aria-label="关于代码浏览器" onClick={() => setHelpOpen(true)}><BookOpen size={20} /></button><span className="activity-avatar"><Code2 size={15} /></span></div>
       </nav>
       {sidebarVisible && <aside className="sidebar">
-        <div className="panel-heading"><h2>{panel === 'files' ? '文件浏览' : '全项目搜索'}</h2><div>{panel === 'files' && <button className="icon-button" title="折叠所有文件夹" aria-label="折叠所有文件夹" onClick={() => setCollapseKey(value => value + 1)}><ListTree size={15} /></button>}<button className="icon-button" title="收起侧栏" aria-label="收起侧栏" onClick={() => setSidebarVisible(false)}><PanelLeftClose size={16} /></button></div></div>
+        <div className="panel-heading"><h2>{panel === 'files' ? '文件浏览' : panel === 'search' ? '全项目搜索' : '引用'}</h2><div>{panel === 'files' && <button className="icon-button" title="折叠所有文件夹" aria-label="折叠所有文件夹" onClick={() => setCollapseKey(value => value + 1)}><ListTree size={15} /></button>}<button className="icon-button" title="收起侧栏" aria-label="收起侧栏" onClick={() => setSidebarVisible(false)}><PanelLeftClose size={16} /></button></div></div>
         {panel === 'files' && <><div className="sidebar-filter"><Search size={13} /><input placeholder="查找文件…" aria-label="查找文件" value={fileFilter} onChange={event => setFileFilter(event.target.value)} />{fileFilter && <button aria-label="清空文件筛选" onClick={() => setFileFilter('')}><X size={12} /></button>}</div><div className="tree-project-heading"><ChevronDown size={13} /><span>{workspace.name}</span><span className="file-count">{workspace.files.length}</span></div><FileTree files={workspace.files} activePath={activePath} filter={fileFilter} onOpen={openFile} collapseKey={collapseKey} /></>}
         {panel === 'search' && <><div className="search-box"><div className="search-input"><Search size={14} /><input ref={searchRef} placeholder="搜索项目代码…" aria-label="搜索项目代码" value={query} onChange={event => setQuery(event.target.value)} /><button title="区分大小写" aria-label="区分大小写" aria-pressed={caseSensitive} className={caseSensitive ? 'enabled' : ''} onClick={() => setCaseSensitive(value => !value)}>Aa</button><button title="全字匹配" aria-label="全字匹配" aria-pressed={wholeWord} className={wholeWord ? 'enabled' : ''} onClick={() => setWholeWord(value => !value)}>ab</button></div><div className="search-summary">{query ? `${search.truncated ? '前 ' : ''}${search.results.length} 处结果 · ${searchGroups.length} 个文件${search.truncated ? '（已达上限）' : ''}` : '搜索项目内所有文本文件'}</div></div><div className="search-results">{searchGroups.map(([path, results]) => <div className="result-group" key={path}><div className="result-file"><ChevronDown size={12} /><FileIcon path={path} /><span className="ellipsis" title={path}>{path}</span><span>{results.length}</span></div>{results.map((result, index) => <button className="result-row" key={`${result.line}:${result.column}:${index}`} onClick={() => openFile(result.path, result.line, result.column, result.length)} title={`${path}:${result.line}`}><span className="result-line">{result.line}</span><span className="result-snippet">{result.text.slice(Math.max(0, result.column - 31), result.column - 1)}<mark>{result.text.slice(result.column - 1, result.column - 1 + result.length)}</mark>{result.text.slice(result.column - 1 + result.length, result.column + result.length + 85)}</span></button>)}</div>)}{query && !search.results.length && <div className="search-empty"><TextSearch size={30} /><p>没有找到匹配的代码</p><span>试试其他关键词或调整匹配选项</span></div>}{!query && <div className="search-empty"><TextSearch size={32} /><p>在整个项目中查找</p><span>搜索文本、组件名或 import 路径</span><kbd>{mod} Shift F</kbd></div>}</div></>}
+        {panel === 'references' && <div className="reference-panel">{referenceState ? <><div className="reference-summary"><strong>{referenceState.definition.name}</strong><span>{referenceState.references.length} 处位置{referenceState.truncated ? '（已截断）' : ''}</span><small>{referenceState.definition.path}:{referenceState.definition.line}</small></div><div className="reference-groups">{referenceGroups.map(([path, results]) => <div className="result-group" key={path}><div className="result-file"><Share2 size={12} /><span className="ellipsis" title={path}>{path}</span><span>{results.length}</span></div>{results.map(result => <button className="reference-row" key={`${result.path}:${result.offset}`} title={`${result.path}:${result.line}`} onClick={() => openDefinition(result)}><span className="result-line">{result.line}</span><span className="reference-role">{referenceRoleLabels[result.role]}</span><span className="reference-snippet ellipsis">{lineSnippet(result.path, result.line)}</span></button>)}</div>)}</div></> : <div className="search-empty"><Share2 size={30} /><p>查找符号引用</p><span>将光标放在组件或变量上，按 Shift F12</span></div>}</div>}
         <div className="sidebar-bottom"><div><ShieldCheck size={15} /><span>文件只在你的浏览器中读取</span></div><span>不会上传，也不会修改本地文件</span><button onClick={() => uploadRef.current?.click()} disabled={busy}>兼容模式导入目录 <ArrowRight size={12} /></button></div>
       </aside>}
       <section className="editor-section" aria-label="代码预览">
-        <div className="tab-strip">{!sidebarVisible && <button className="icon-button restore-sidebar" title="展开侧栏" aria-label="展开侧栏" onClick={() => setSidebarVisible(true)}><PanelLeftOpen size={17} /></button>}<div className="tabs">{tabs.map(path => <div className={`file-tab ${path === activePath ? 'active' : ''}`} key={path}><button className="tab-name" title={path} onClick={() => openFile(path)}><FileIcon path={path} /><span>{basename(path)}</span></button><button className="tab-close" title={`关闭 ${basename(path)}`} aria-label={`关闭 ${basename(path)}`} onClick={() => closeTab(path)}><X size={12} /></button></div>)}</div><div className="tab-controls"><button className="icon-button" title="重新读取本地项目" aria-label="重新读取本地项目" disabled={busy || workspace.mode === 'demo'} onClick={refresh}><RefreshCw size={14} className={busy ? 'spin' : ''} /></button><button className="icon-button" title="文件内搜索" aria-label="文件内搜索" onClick={() => viewerRef.current?.find()}><TextSearch size={15} /></button></div></div>
-        {activeFile ? <><div className="code-toolbar"><div className="code-breadcrumb">{activeFile.path.split('/').map((part, index, parts) => <span key={index} className={index === parts.length - 1 ? 'current-crumb' : ''}>{index === parts.length - 1 && <FileIcon path={activeFile.path} size={14} />}{part}{index < parts.length - 1 && <ChevronRight size={11} />}</span>)}</div><div className="code-actions"><button className="icon-button" aria-label="复制当前文件" title="复制当前文件" onClick={copyCode}><Copy size={14} /></button><span className="code-readonly"><Eye size={12} />只读</span></div></div>
-          {workspace.mode === 'demo' && <div className="demo-banner"><Sparkles size={15} /><span>先探索一下示例项目，或打开本地 React 项目。</span><button onClick={openLocal}>打开项目 <ArrowRight size={13} /></button><button className="banner-help" onClick={() => setHelpOpen(true)} title="查看使用说明" aria-label="查看使用说明"><Info size={14} /></button></div>}
-          <div className="editor-surface"><Suspense fallback={<div className="editor-loading"><LoaderCircle size={20} className="spin" />正在加载代码预览…</div>}><CodeViewer key={workspaceId} file={activeFile} target={target} viewerRef={viewerRef} onCursor={(line, column) => setCursor({ line, column })} /></Suspense></div>
-          <div className="editor-hint"><span><TextSearch size={12} />代码预览</span><span><kbd>{mod} F</kbd> 文件内搜索</span><span className="hint-right">仅浏览 · 放心探索你的代码</span></div></> : <div className="empty-editor"><span className="empty-brand"><Code2 size={40} /></span><h1>你的代码，一目了然。</h1><p>打开本地项目，从文件树开始探索。</p><button className="primary-button" onClick={openLocal}><FolderOpen size={16} />打开本地项目</button><button className="text-button" onClick={showQuickOpen}>快速打开文件 <kbd>{mod} P</kbd></button></div>}
+        <div className="tab-strip">{!sidebarVisible && <button className="icon-button restore-sidebar" title="展开侧栏" aria-label="展开侧栏" onClick={() => setSidebarVisible(true)}><PanelLeftOpen size={17} /></button>}<div className="tabs">{tabs.map(path => <div className={`file-tab ${path === activePath ? 'active' : ''}`} key={path}><button className="tab-name" title={path} onClick={() => openFile(path)}><FileIcon path={path} /><span>{basename(path)}</span></button><button className="tab-close" title={`关闭 ${basename(path)}`} aria-label={`关闭 ${basename(path)}`} onClick={() => closeTab(path)}><X size={12} /></button></div>)}</div><div className="tab-controls"><button className="icon-button" title="重新读取本地项目" aria-label="重新读取本地项目" disabled={busy} onClick={refresh}><RefreshCw size={14} className={busy ? 'spin' : ''} /></button><button className="icon-button" title="文件内搜索" aria-label="文件内搜索" onClick={() => viewerRef.current?.find()}><TextSearch size={15} /></button></div></div>
+        {activeFile ? <><div className="code-toolbar"><div className="code-breadcrumb">{activeFile.path.split('/').map((part, index, parts) => <span key={index} className={index === parts.length - 1 ? 'current-crumb' : ''}>{index === parts.length - 1 && <FileIcon path={activeFile.path} size={14} />}{part}{index < parts.length - 1 && <ChevronRight size={11} />}</span>)}</div><div className="code-actions"><button className="code-action" aria-label="跳转到定义" title="跳转到定义 (F12)" onClick={goToDefinition}><LocateFixed size={14} /><span>定义</span></button><button className="code-action" aria-label="查找引用" title="查找引用 (Shift F12)" onClick={showReferences}><Share2 size={14} /><span>引用</span></button><button className="icon-button" aria-label="复制当前文件" title="复制当前文件" onClick={copyCode}><Copy size={14} /></button><span className="code-readonly"><Eye size={12} />只读</span></div></div>
+          <div className="editor-surface"><Suspense fallback={<div className="editor-loading"><LoaderCircle size={20} className="spin" />正在加载代码预览…</div>}><CodeViewer key={workspaceId} file={activeFile} target={target} viewerRef={viewerRef} index={projectIndex} onDefinition={openDefinition} onCursor={(line, column) => setCursor({ line, column })} /></Suspense></div>
+          <div className="editor-hint"><span><TextSearch size={12} />代码预览</span><span><LocateFixed size={11} />单击符号跳转定义</span><span><kbd>{mod} F</kbd> 文件内搜索</span><span className="hint-right">仅浏览 · 放心探索你的代码</span></div></> : <div className="empty-editor"><span className="empty-brand"><Code2 size={40} /></span><h1>你的代码，一目了然。</h1><p>打开本地 React 项目，从文件树开始探索；组件和引用都支持跳转。</p><button className="primary-button" onClick={openLocal}><FolderOpen size={16} />打开本地项目</button><button className="text-button" onClick={showQuickOpen}>快速打开文件 <kbd>{mod} P</kbd></button></div>}
       </section>
     </main>
-    <footer className="statusbar"><div><span className="status-connected"><span />{workspace.mode === 'demo' ? '示例工作空间' : '本地工作空间'}</span><span className="status-file-count"><Files size={12} />{workspace.files.length} 个文件</span></div><div><span>行 {cursor.line}，列 {cursor.column}</span><span>{totalLines} 行</span><span className="status-encoding">UTF-8</span><span>{activeFile ? languageLabels[languageFor(activeFile.path)] || languageFor(activeFile.path) : ''}</span><span className="status-readonly"><Eye size={12} />只读</span></div></footer>
+    <footer className="statusbar"><div><span className="status-connected"><span />{workspace.mode === 'empty' ? '等待打开工作空间' : '本地工作空间'}</span><span className="status-file-count"><Files size={12} />{workspace.files.length} 个文件</span></div><div><span>行 {cursor.line}，列 {cursor.column}</span><span>{totalLines} 行</span><span className="status-encoding">UTF-8</span><span>{activeFile ? languageLabels[languageFor(activeFile.path)] || languageFor(activeFile.path) : ''}</span><span className="status-readonly"><Eye size={12} />只读</span></div></footer>
     {notice && <div className="toast" role="status"><Info size={17} /><span>{notice}</span><button aria-label="关闭提示" onClick={() => setNotice('')}><X size={15} /></button></div>}
     {busy && <div className="loading-indicator" role="status"><LoaderCircle size={15} className="spin" />正在读取本地文件 · {progress}</div>}
     {quickOpen && <div className="modal-backdrop" onClick={() => setQuickOpen(false)}><div className="quick-dialog" role="dialog" aria-modal="true" aria-label="快速打开文件" onClick={event => event.stopPropagation()}><div className="quick-input"><Search size={18} /><input ref={quickRef} placeholder="输入文件名称或路径…" aria-label="快速打开文件名称" value={quickQuery} onChange={event => setQuickQuery(event.target.value)} onKeyDown={event => {
@@ -154,6 +181,6 @@ export default function App() {
       if (event.key === 'ArrowUp') { event.preventDefault(); setQuickIndex(index => Math.max(index - 1, 0)); }
       if (event.key === 'Enter' && quickFiles[quickIndex]) { openFile(quickFiles[quickIndex].path); setQuickOpen(false); }
     }} /><kbd>esc</kbd></div><div className="quick-list">{quickFiles.map((file, index) => <button key={file.path} className={index === quickIndex ? 'selected' : ''} onClick={() => { openFile(file.path); setQuickOpen(false); }}><FileIcon path={file.path} /><span>{basename(file.path)}</span><small className="ellipsis">{file.path}</small>{index === quickIndex && <span>↵</span>}</button>)}{!quickFiles.length && <p className="panel-empty">没有匹配的文件</p>}</div><div className="quick-footer"><span><ArrowUp size={12} /><ArrowDown size={12} />选择</span><span>↵ 打开文件</span><span>{workspace.files.length} 个文件</span></div></div></div>}
-    {helpOpen && <div className="modal-backdrop" onClick={() => setHelpOpen(false)}><div className="help-dialog" role="dialog" aria-modal="true" aria-labelledby="help-title" onClick={event => event.stopPropagation()}><button className="dialog-close icon-button" aria-label="关闭使用说明" onClick={() => setHelpOpen(false)}><X size={18} /></button><span className="help-symbol"><Code2 size={28} /></span><h2 id="help-title">在浏览器里，探索本地代码。</h2><p className="help-intro">一个专注于 React 项目的只读代码浏览器。</p><div className="help-feature"><FolderOpen size={19} /><div><strong>打开本地项目</strong><p>在 localhost / 127.0.0.1 下使用 Chrome 或 Edge，通过目录选择器授权读取。其他浏览器可用兼容模式导入；文件始终留在浏览器内。</p></div></div><div className="help-feature"><Search size={19} /><div><strong>搜索项目代码</strong><p>全文搜索支持大小写与全字匹配，点击结果定位到对应行。顶部搜索框可按文件名称或路径快速打开文件，代码区也支持文件内搜索。</p></div></div><div className="help-feature"><RefreshCw size={19} /><div><strong>按需刷新</strong><p>本地文件变更后，点击右上方刷新重新读取。导入模式需要重新选择目录。自动忽略依赖、构建目录和二进制文件；最多读取 2,000 个文件，单文件 2 MB，总计 32 MB。</p></div></div><div className="shortcut-grid"><span>快速打开文件</span><kbd>{mod} P</kbd><span>全项目搜索</span><kbd>{mod} Shift F</kbd><span>文件内搜索</span><kbd>{mod} F</kbd><span>展开 / 收起文件树</span><kbd>{mod} B</kbd></div><div className="help-security"><ShieldCheck size={15} /><span>仅请求读取权限，不上传、不编辑本地文件。</span></div><button className="primary-button" onClick={() => setHelpOpen(false)}><Check size={15} />开始探索</button></div></div>}
+    {helpOpen && <div className="modal-backdrop" onClick={() => setHelpOpen(false)}><div className="help-dialog" role="dialog" aria-modal="true" aria-labelledby="help-title" onClick={event => event.stopPropagation()}><button className="dialog-close icon-button" aria-label="关闭使用说明" onClick={() => setHelpOpen(false)}><X size={18} /></button><span className="help-symbol"><Code2 size={28} /></span><h2 id="help-title">在浏览器里，探索本地代码。</h2><p className="help-intro">一个专注于 React 项目的只读代码浏览器。</p><div className="help-feature"><FolderOpen size={19} /><div><strong>打开本地项目</strong><p>在 localhost / 127.0.0.1 下使用 Chrome 或 Edge，通过目录选择器授权读取。其他浏览器可用兼容模式导入；文件始终留在浏览器内。</p></div></div><div className="help-feature"><LocateFixed size={19} /><div><strong>组件与引用跳转</strong><p>组件名、函数、变量和类型会自动识别。单击代码中的符号跳到定义；按 Shift F12 查看当前符号的项目内引用。</p></div></div><div className="help-feature"><Search size={19} /><div><strong>搜索项目代码</strong><p>全文搜索支持大小写与全字匹配，点击结果定位到对应行。顶部搜索框可按文件名称或路径快速打开文件，代码区也支持文件内搜索。</p></div></div><div className="help-feature"><RefreshCw size={19} /><div><strong>按需刷新</strong><p>本地文件变更后，点击右上方刷新重新读取。导入模式需要重新选择目录。自动忽略依赖、构建目录和二进制文件；最多读取 2,000 个文件，单文件 2 MB，总计 32 MB。</p></div></div><div className="shortcut-grid"><span>快速打开文件</span><kbd>{mod} P</kbd><span>全项目搜索</span><kbd>{mod} Shift F</kbd><span>文件内搜索</span><kbd>{mod} F</kbd><span>跳转到定义</span><kbd>F12</kbd><span>查找引用</span><kbd>Shift F12</kbd><span>展开 / 收起文件树</span><kbd>{mod} B</kbd></div><div className="help-security"><ShieldCheck size={15} /><span>仅请求读取权限，不上传、不编辑本地文件。</span></div><button className="primary-button" onClick={() => setHelpOpen(false)}><Check size={15} />开始探索</button></div></div>}
   </div>;
 }

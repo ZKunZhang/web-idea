@@ -3,16 +3,20 @@ import { ArrowDown, ArrowUp, Search, X } from 'lucide-react';
 import { highlightLines, type CodeSegment } from '../lib/highlight';
 import type { WorkspaceFile } from '../lib/workspace';
 import { searchFiles } from '../lib/search';
+import { getNavigationLinks, type NavigationTarget, type ProjectIndex } from '../lib/navigation';
 export type ViewerHandle = { find: () => void };
 export type Target = { path: string; line: number; column: number; length?: number; request: number };
 const LINE_HEIGHT = 23;
 const TOP_PADDING = 22;
 
-export default function CodeViewer({ file, target, viewerRef, onCursor }: {
+export default function CodeViewer({ file, target, viewerRef, onCursor, index, onDefinition }: {
   file: WorkspaceFile; target: Target | null;
   viewerRef: MutableRefObject<ViewerHandle | null>; onCursor: (line: number, column: number) => void;
+  index: ProjectIndex; onDefinition: (target: NavigationTarget) => void;
 }) {
   const lines = useMemo(() => highlightLines(file.path, file.content), [file]);
+  const navigationLinks = useMemo(() => getNavigationLinks(index, file.path), [index, file.path]);
+  const linkByOffset = useMemo(() => new Map(navigationLinks.map(link => [link.offset, link])), [navigationLinks]);
   const viewport = useRef<HTMLDivElement>(null);
   const findInput = useRef<HTMLInputElement>(null);
   const scrollPositions = useRef(new Map<string, number>());
@@ -79,13 +83,36 @@ export default function CodeViewer({ file, target, viewerRef, onCursor }: {
   const start = Math.max(0, Math.floor((scrollTop - TOP_PADDING) / LINE_HEIGHT) - 15);
   const end = Math.min(lines.length, start + Math.ceil(height / LINE_HEIGHT) + 35);
   function renderSegment(segment: CodeSegment): ReactNode {
-    let value: ReactNode = segment.text;
-    if (selection && segment.offset < selection.offset + selection.length && segment.offset + segment.text.length > selection.offset) {
-      const from = Math.max(0, selection.offset - segment.offset);
-      const to = Math.min(segment.text.length, selection.offset + selection.length - segment.offset);
-      value = <>{segment.text.slice(0, from)}<mark className="code-match">{segment.text.slice(from, to)}</mark>{segment.text.slice(to)}</>;
+    const boundaries = new Set([0, segment.text.length]);
+    for (const link of navigationLinks) {
+      const from = link.offset - segment.offset;
+      const to = from + link.length;
+      if (to <= 0 || from >= segment.text.length) continue;
+      boundaries.add(Math.max(0, from));
+      boundaries.add(Math.min(segment.text.length, to));
     }
-    return <span className={`token ${segment.classes}`} data-offset={segment.offset}>{value}</span>;
+    if (selection) {
+      boundaries.add(Math.max(0, selection.offset - segment.offset));
+      boundaries.add(Math.min(segment.text.length, selection.offset + selection.length - segment.offset));
+    }
+    const points = [...boundaries].sort((a, b) => a - b);
+    const parts: ReactNode[] = [];
+    for (let index = 0; index < points.length - 1; index++) {
+      const from = points[index];
+      const to = points[index + 1];
+      if (from === to) continue;
+      const absolute = segment.offset + from;
+      let value: ReactNode = segment.text.slice(from, to);
+      if (selection && absolute < selection.offset + selection.length && absolute + (to - from) > selection.offset) {
+        const markFrom = Math.max(0, selection.offset - absolute);
+        const markTo = Math.min(to - from, selection.offset + selection.length - absolute);
+        value = <>{segment.text.slice(from, from + markFrom)}<mark className="code-match">{segment.text.slice(from + markFrom, from + markTo)}</mark>{segment.text.slice(from + markTo, to)}</>;
+      }
+      const link = linkByOffset.get(absolute) || navigationLinks.find(item => item.offset <= absolute && absolute < item.offset + item.length);
+      if (link) value = <span className={`nav-link ${link.role} ${link.target.kind === 'component' ? 'component' : ''}`} data-nav-offset={link.offset} title={`${link.name} → ${link.target.path}:${link.target.line}（点击跳转定义）`}>{value}</span>;
+      parts.push(<span key={index}>{value}</span>);
+    }
+    return <span className={`token ${segment.classes}`} data-offset={segment.offset}>{parts}</span>;
   }
   return <div className="code-viewer">
     {findVisible && <div className="file-find" role="search" aria-label="文件内搜索"><Search size={14} /><input ref={findInput} aria-label="文件内搜索文本" placeholder="在当前文件中查找…" value={findQuery} onChange={event => setFindQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') nextMatch(event.shiftKey ? -1 : 1); if (event.key === 'Escape') { setFindVisible(false); viewport.current?.focus(); } }} /><span>{matches.length ? `${matchIndex + 1}/${matches.length}${matches.length === 1000 ? '+' : ''}` : '0/0'}</span><button aria-label="上一个匹配" onClick={() => nextMatch(-1)} disabled={!matches.length}><ArrowUp size={14} /></button><button aria-label="下一个匹配" onClick={() => nextMatch(1)} disabled={!matches.length}><ArrowDown size={14} /></button><button aria-label="关闭文件内搜索" onClick={() => setFindVisible(false)}><X size={14} /></button></div>}
@@ -95,6 +122,9 @@ export default function CodeViewer({ file, target, viewerRef, onCursor }: {
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') { event.preventDefault(); viewerRef.current?.find(); }
       }}
       onClick={event => {
+        const navigation = (event.target as HTMLElement).closest<HTMLElement>('[data-nav-offset]');
+        const link = navigation ? linkByOffset.get(Number(navigation.dataset.navOffset)) : null;
+        if (link) { event.preventDefault(); onDefinition(link.target); return; }
         const span = (event.target as HTMLElement).closest<HTMLElement>('[data-offset]');
         const row = (event.target as HTMLElement).closest<HTMLElement>('[data-line]');
         if (!row) return;
